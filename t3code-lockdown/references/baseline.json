@@ -1,0 +1,136 @@
+{
+  "baselineSchemaVersion": 1,
+  "auditedAt": "2026-11-26",
+  "auditedCommit": "b6869fad",
+  "auditedVersions": [
+    "0.1.11"
+  ],
+  "policySchemaVersion": 1,
+  "requiredEnv": {
+    "T3CODE_TELEMETRY_ENABLED": "false",
+    "T3CODE_OTEL_SDK_DISABLED": "true"
+  },
+  "profiles": {
+    "standard": {
+      "description": "Blocks usage telemetry, T3 Connect, and auto/nightly updates while keeping Tailscale remote access usable.",
+      "limits": {
+        "telemetry": false,
+        "connect": false,
+        "updates": {
+          "mode": "off",
+          "allowNightly": false
+        }
+      },
+      "settings": {}
+    },
+    "strict": {
+      "description": "Adds locks on webhook tasks, browser cookie import, preview tunnel, and provider CLI update checks.",
+      "limits": {
+        "telemetry": false,
+        "connect": false,
+        "webhookTasks": false,
+        "browserCookieImport": false,
+        "previewTunnel": false,
+        "updates": {
+          "mode": "off",
+          "allowNightly": false
+        }
+      },
+      "settings": {
+        "enableProviderUpdateChecks": {
+          "value": false,
+          "locked": true
+        }
+      }
+    }
+  },
+  "forbiddenUserSettings": {
+    "always": [
+      "publishAgentActivity"
+    ],
+    "strictOnly": [
+      "enableProviderUpdateChecks"
+    ]
+  },
+  "forbiddenProcesses": [
+    "cloudflared"
+  ],
+  "exitCodes": {
+    "VERIFIED": 0,
+    "FAIL": 1,
+    "PENDING_RESTART": 10,
+    "DRIFT_DETECTED": 20,
+    "INCOMPLETE": 30
+  },
+  "admxPolicies": {
+    "AllowedDrivers": [
+      "AllowedDrivers_acpRegistry",
+      "AllowedDrivers_antigravity",
+      "AllowedDrivers_claudeAgent",
+      "AllowedDrivers_codex",
+      "AllowedDrivers_cursor",
+      "AllowedDrivers_fx",
+      "AllowedDrivers_grok",
+      "AllowedDrivers_kiro",
+      "AllowedDrivers_muse",
+      "AllowedDrivers_opencode",
+      "AllowedDrivers_pi"
+    ],
+    "BrowserCookieImport": [],
+    "Clients": [
+      "Clients_desktop",
+      "Clients_local-browser",
+      "Clients_remote"
+    ],
+    "Connect": [],
+    "MaxRuntimeMode": [
+      "MaxRuntimeMode"
+    ],
+    "Organization": [
+      "Organization",
+      "SupportUrl"
+    ],
+    "PreviewTunnel": [],
+    "ProviderInstances": [
+      "ProviderInstances"
+    ],
+    "Settings": [
+      "Settings"
+    ],
+    "Telemetry": [],
+    "Updates": [
+      "AllowNightly",
+      "UpdatesFeedUrl",
+      "UpdatesMode"
+    ],
+    "WebhookTasks": []
+  },
+  "cliSubcommands": [
+    "app",
+    "auth",
+    "browser",
+    "connect",
+    "doctor",
+    "environment",
+    "help",
+    "install",
+    "pair",
+    "policy",
+    "project",
+    "serve",
+    "service",
+    "status",
+    "theme",
+    "thread",
+    "trace",
+    "triage",
+    "uninstall",
+    "up",
+    "update"
+  ],
+  "policySubcommands": [
+    "check",
+    "show",
+    "templates"
+  ]
+}
