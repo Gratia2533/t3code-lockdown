@@ -19,6 +19,33 @@ from typing import Any
 
 ADMX_NS = {"p": "http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions"}
 
+TEST_MODE_ENV = "T3CODE_LOCKDOWN_TEST_MODE"
+TEST_ONLY_ENV_VARS = (
+    "T3CODE_OS_OVERRIDE",
+    "T3CODE_ASSUME_WSL",
+    "T3CODE_WSL_WIN_POLICY",
+    "T3CODE_MACOS_MDM_PLIST",
+    "T3CODE_PROC_ROOT",
+    "T3CODE_PS_OUTPUT_FILE",
+    "T3CODE_SKIP_LAUNCHCTL",
+    "T3CODE_NO_SUDO",
+)
+
+
+def is_test_mode() -> bool:
+    return os.environ.get(TEST_MODE_ENV) == "1"
+
+
+def active_test_overrides() -> list[str]:
+    return [k for k in TEST_ONLY_ENV_VARS if k in os.environ and os.environ.get(k, "") != ""]
+
+
+def test_env(name: str, default: str | None = None) -> str | None:
+    """Return a test-only env override ONLY when T3CODE_LOCKDOWN_TEST_MODE=1."""
+    if is_test_mode() and name in os.environ:
+        return os.environ[name]
+    return default
+
 
 def load_baseline(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as fh:
@@ -169,6 +196,9 @@ def discover_t3_binary(explicit: str | None, t3_home: str, os_name: str) -> str 
     if on_path:
         candidates.append(on_path)
 
+    bin_direct = os.path.join(t3_home, "bin", "t3")
+    candidates.append(bin_direct)
+
     for pattern in (
         os.path.join(t3_home, "wsl-runtime", "sha256-*", "t3"),
         os.path.join(t3_home, "tools", "*", "t3"),
@@ -273,9 +303,10 @@ def deep_subset_check(actual: Any, expected: Any, prefix: str = "") -> list[str]
 
 
 def is_wsl() -> bool:
-    if os.environ.get("T3CODE_ASSUME_WSL") == "1":
+    override = test_env("T3CODE_ASSUME_WSL")
+    if override == "1":
         return True
-    if os.environ.get("T3CODE_ASSUME_WSL") == "0":
+    if override == "0":
         return False
     try:
         with open("/proc/version", encoding="utf-8", errors="replace") as fh:
@@ -298,7 +329,7 @@ def pid_is_alive(pid: int) -> bool:
 
 def read_proc_env_selected(pid: int, keys: list[str]) -> tuple[dict[str, str | None] | None, str | None]:
     """Read ONLY the requested env keys from /proc/<pid>/environ (never touches secrets)."""
-    proc_root = os.environ.get("T3CODE_PROC_ROOT", "/proc")
+    proc_root = test_env("T3CODE_PROC_ROOT", "/proc") or "/proc"
     env_path = os.path.join(proc_root, str(pid), "environ")
     try:
         with open(env_path, "rb") as fh:
@@ -318,8 +349,48 @@ def read_proc_env_selected(pid: int, keys: list[str]) -> tuple[dict[str, str | N
     return result, None
 
 
+def _args_executes_binary(args_s: str, binary_name: str) -> bool:
+    """Return True if args_s actually invokes binary_name as the command (not as a grep/editor argument)."""
+    tokens = args_s.split()
+    if not tokens:
+        return False
+    wrapper_val_flags = {
+        "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U"},
+        "env": {"-u", "-C", "-S", "--chdir", "--unset"},
+        "nice": {"-n"},
+        "timeout": {"-k", "-s", "--kill-after", "--signal"},
+        "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    }
+    wrappers = set(wrapper_val_flags) | {"nohup", "setsid", "exec"}
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        base = os.path.basename(tok)
+        if base in wrappers:
+            idx += 1
+            val_flags = wrapper_val_flags.get(base, set())
+            while idx < len(tokens):
+                cur = tokens[idx]
+                if cur == "--":
+                    idx += 1
+                    break
+                if cur in val_flags:
+                    idx += 2
+                    continue
+                if cur.startswith("-") or (base == "env" and "=" in cur):
+                    idx += 1
+                    continue
+                if base == "timeout" and re.match(r"^\d+(?:\.\d+)?[smhd]?$", cur):
+                    idx += 1
+                    continue
+                break
+            continue
+        return base == binary_name
+    return False
+
+
 def inspect_forbidden_processes(forbidden: list[str]) -> tuple[list[str] | None, str | None]:
-    override = os.environ.get("T3CODE_PS_OUTPUT_FILE")
+    override = test_env("T3CODE_PS_OUTPUT_FILE")
     if override:
         try:
             with open(override, encoding="utf-8", errors="replace") as fh:
@@ -344,7 +415,7 @@ def inspect_forbidden_processes(forbidden: list[str]) -> tuple[list[str] | None,
             continue
         comm_base = os.path.basename(comm)
         for name in forbidden:
-            if comm_base == name or re.search(rf"(?:^|/){re.escape(name)}(?:\s|$)", args_s):
+            if comm_base == name or _args_executes_binary(args_s, name):
                 hits.append(f"pid={pid_s} comm={comm_base}")
                 break
     return hits, None

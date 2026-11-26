@@ -20,6 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from audit_lib import (  # noqa: E402
+    active_test_overrides,
     build_policy_document,
     capture_snapshot,
     compute_drift,
@@ -27,12 +28,14 @@ from audit_lib import (  # noqa: E402
     discover_t3_binary,
     inspect_forbidden_processes,
     inspect_server_sockets,
+    is_test_mode,
     is_wsl,
     load_baseline,
     parse_env_assignments,
     pid_is_alive,
     read_proc_env_selected,
     run_cmd,
+    test_env,
 )
 
 VERDICT_PRIORITY = {
@@ -113,7 +116,32 @@ def _audit_static(
     else:
         _add_check(checks, "env.service_env", "static", "INFO", f"No service.env at {args.service_env} (ok if not using 't3 service').")
 
-    if os_name == "Darwin" and os.environ.get("T3CODE_SKIP_LAUNCHCTL") != "1":
+    # Check extra shell startup files (read-only) for conflicting overrides.
+    home_dir = os.path.expanduser("~")
+    extra_profiles = [
+        os.path.join(home_dir, name)
+        for name in (".profile", ".bash_profile", ".zprofile", ".zshenv")
+        if os.path.join(home_dir, name) not in rc_list and os.path.isfile(os.path.join(home_dir, name))
+    ]
+    for prof_path in extra_profiles:
+        parsed_extra = parse_env_assignments(prof_path, env_keys, kind="rc")
+        conflicts = {
+            k: {"expected": req_env[k], "actual": parsed_extra["effective"][k]}
+            for k in env_keys
+            if parsed_extra["effective"][k] is not None and parsed_extra["effective"][k] != req_env[k]
+        }
+        if conflicts:
+            static_env_ok = False
+            _add_check(
+                checks,
+                f"env.profile:{prof_path}",
+                "static",
+                "FAIL",
+                f"Conflicting env override found in {prof_path}",
+                {"mismatches": conflicts},
+            )
+
+    if os_name == "Darwin" and test_env("T3CODE_SKIP_LAUNCHCTL") != "1":
         lc_bad = {}
         for k, want in req_env.items():
             code, out, _ = run_cmd(["launchctl", "getenv", k])
@@ -127,7 +155,7 @@ def _audit_static(
 
     if os_name == "Darwin":
         mdm_paths = [
-            os.environ.get("T3CODE_MACOS_MDM_PLIST", "/Library/Managed Preferences/com.t3tools.t3code.plist"),
+            test_env("T3CODE_MACOS_MDM_PLIST", "/Library/Managed Preferences/com.t3tools.t3code.plist"),
             os.path.expanduser("~/Library/Managed Preferences/com.t3tools.t3code.plist"),
         ]
         found_mdm = [p for p in mdm_paths if p and os.path.exists(p)]
@@ -137,11 +165,11 @@ def _audit_static(
             _add_check(checks, "conflict.macos_mdm", "static", "INFO", f"macOS MDM profile detected at {found_mdm[0]} (file policy skipped).")
 
     if os_name == "Linux" and is_wsl():
-        win_policy = os.environ.get("T3CODE_WSL_WIN_POLICY", "/mnt/c/Program Files/T3Code/policy.json")
+        win_policy = test_env("T3CODE_WSL_WIN_POLICY", "/mnt/c/Program Files/T3Code/policy.json") or "/mnt/c/Program Files/T3Code/policy.json"
         if os.path.exists(win_policy):
             _add_check(checks, "conflict.wsl_windows_policy", "static", "FAIL", f"Windows policy exists at {win_policy}; T3 Code desktop will run server on Windows and bypass WSL policy.")
         else:
-            _add_check(checks, "conflict.wsl_windows_policy", "static", "PASS", "WSL check: no Windows policy file at /mnt/c/Program Files/T3Code/policy.json.")
+            _add_check(checks, "conflict.wsl_windows_policy", "static", "PASS", f"WSL check: no Windows policy file at {win_policy}.")
 
     if args.no_policy:
         _add_check(checks, "policy.file", "static", "INFO", "Policy file check skipped (--no-policy).")
@@ -386,6 +414,26 @@ def run_verify(args: argparse.Namespace) -> dict[str, Any]:
     userdata_dir = os.path.join(t3_home, "userdata")
     checks: list[dict[str, Any]] = []
 
+    overrides = active_test_overrides()
+    if is_test_mode():
+        _add_check(
+            checks,
+            "audit.test_mode",
+            "static",
+            "INFO",
+            f"Running in explicit test mode (T3CODE_LOCKDOWN_TEST_MODE=1); active overrides: {', '.join(overrides) or 'none'}.",
+            {"activeTestOverrides": overrides},
+        )
+    elif overrides:
+        _add_check(
+            checks,
+            "audit.unexpected_test_env",
+            "static",
+            "INCOMPLETE",
+            f"Test-only override env vars detected outside test mode (ignored, refusing VERIFIED): {', '.join(overrides)}. Unset them and re-run verify.",
+            {"ignoredOverrides": overrides},
+        )
+
     static_env_ok = _audit_static(checks, baseline, args, userdata_dir)
     t3_bin, running_pid, runtime_pid_alive, running_version = _audit_runtime(
         checks, baseline, args, t3_home, userdata_dir, static_env_ok
@@ -420,7 +468,9 @@ def run_verify(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "verdict": verdict,
         "exitCode": exit_code,
-        "safeToClaimLocked": verdict == "VERIFIED",
+        "safeToClaimLocked": verdict == "VERIFIED" and not is_test_mode(),
+        "testMode": is_test_mode(),
+        "activeTestOverrides": overrides if is_test_mode() else [],
         "profile": args.profile,
         "platform": args.os_name,
         "isWsl": is_wsl() if args.os_name == "Linux" else False,

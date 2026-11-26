@@ -101,10 +101,9 @@ function Find-T3Binary {
   if (-not [string]::IsNullOrWhiteSpace($env:T3_BIN)) { $candidates.Add($env:T3_BIN) }
   $cmd = Get-Command t3 -ErrorAction SilentlyContinue
   if ($cmd) { $candidates.Add($cmd.Source) }
-  if ($env:LOCALAPPDATA) {
-    $candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\T3 Code\resources\bin\t3.exe'))
-    $candidates.Add((Join-Path $env:LOCALAPPDATA 'T3Code\bin\t3.exe'))
-  }
+  # Standard Windows CLI launcher installed by T3 Code Desktop: %USERPROFILE%\.t3\bin\t3.cmd
+  $candidates.Add((Join-Path $HomeDir 'bin\t3.cmd'))
+  $candidates.Add((Join-Path $HomeDir 'bin\t3.exe'))
   $toolsDir = Join-Path $HomeDir 'tools'
   if (Test-Path $toolsDir) {
     Get-ChildItem -Path $toolsDir -Filter 't3*.exe' -Recurse -ErrorAction SilentlyContinue |
@@ -151,20 +150,23 @@ function Get-LiveAdmxPolicies {
     [xml]$xml = Read-Utf8Text $admxPath
     $nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
     $nsMgr.AddNamespace('p', 'http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions')
-    $map = [ordered]@{}
-    $names = @()
+    $rawMap = @{}
     foreach ($n in $xml.SelectNodes('//p:policy', $nsMgr)) {
       $pn = $n.GetAttribute('name')
-      if (-not [string]::IsNullOrEmpty($pn)) { $names += $pn }
-    }
-    foreach ($name in ($names | Sort-Object -Unique)) {
-      $node = $xml.SelectSingleNode("//p:policy[@name='$name']", $nsMgr)
-      $elems = @()
-      foreach ($e in $node.SelectNodes('./p:elements/*', $nsMgr)) {
-        $eid = $e.GetAttribute('id')
-        if (-not [string]::IsNullOrEmpty($eid)) { $elems += $eid }
+      if ([string]::IsNullOrEmpty($pn)) { continue }
+      $elems = New-Object System.Collections.Generic.HashSet[string]
+      if ($rawMap.ContainsKey($pn)) {
+        foreach ($existing in $rawMap[$pn]) { [void]$elems.Add($existing) }
       }
-      $map[$name] = @($elems | Sort-Object)
+      foreach ($e in $n.SelectNodes('./p:elements/*', $nsMgr)) {
+        $eid = $e.GetAttribute('id')
+        if (-not [string]::IsNullOrEmpty($eid)) { [void]$elems.Add($eid) }
+      }
+      $rawMap[$pn] = @($elems | Sort-Object)
+    }
+    $map = [ordered]@{}
+    foreach ($name in ($rawMap.Keys | Sort-Object)) {
+      $map[$name] = $rawMap[$name]
     }
     return [ordered]@{ policies = $map; error = $null }
   } catch {

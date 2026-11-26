@@ -28,6 +28,7 @@ param(
   [string]$BaselinePath = '',
   [string]$PolicyPath = 'C:\Program Files\T3Code\policy.json',
   [string]$T3Home = '',
+  [switch]$AllowUnvalidatedPolicy,
   [switch]$CheckWsl,
   [switch]$Json
 )
@@ -99,6 +100,11 @@ function Set-WindowsPolicy {
     if ($exe) {
       $chk = Invoke-NativeCapture -Exe $exe -Arguments @('policy', 'check', $tmpFile)
       if ($chk.exitCode -ne 0) { Log-Action "[policy] ABORTED: 't3 policy check' rejected generated '$ProfileKey' policy (not written)"; return }
+    } elseif (-not $AllowUnvalidatedPolicy) {
+      Log-Action '[policy] ABORTED: t3 binary not found; refusing to write unvalidated policy (pass -T3Bin PATH or -AllowUnvalidatedPolicy to override)'
+      return
+    } else {
+      Log-Action "[policy] WARNING: t3 binary not found; writing policy without 't3 policy check' (-AllowUnvalidatedPolicy)"
     }
     New-Item -ItemType Directory -Force -Path $PolicyDir | Out-Null
     if (Test-Path -LiteralPath $PolicyPath) {

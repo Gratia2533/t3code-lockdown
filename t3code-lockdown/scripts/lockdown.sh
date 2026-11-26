@@ -4,7 +4,7 @@
 #   lockdown.sh [apply|verify|rollback|snapshot]
 #               [--profile standard|strict] [--org NAME]
 #               [--policy-path PATH] [--no-policy]
-#               [--t3-bin PATH] [--json]
+#               [--t3-bin PATH] [--allow-unvalidated-policy] [--json]
 #
 # Exit codes (verify / apply):
 #   0  = VERIFIED        (all static, runtime, network, and drift checks passed)
@@ -36,6 +36,7 @@ PROFILE="standard"
 ORG="Local"
 POLICY_PATH=""
 NO_POLICY=0
+ALLOW_UNVALIDATED_POLICY=0
 T3_BIN_ARG=""
 AS_JSON=0
 
@@ -48,12 +49,13 @@ need_arg() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --profile)     need_arg "$@"; PROFILE="$2"; shift 2 ;;
-    --org)         need_arg "$@"; ORG="$2"; shift 2 ;;
-    --policy-path) need_arg "$@"; POLICY_PATH="$2"; shift 2 ;;
-    --no-policy)   NO_POLICY=1; shift ;;
-    --t3-bin)      need_arg "$@"; T3_BIN_ARG="$2"; shift 2 ;;
-    --json)        AS_JSON=1; shift ;;
+    --profile)                  need_arg "$@"; PROFILE="$2"; shift 2 ;;
+    --org)                      need_arg "$@"; ORG="$2"; shift 2 ;;
+    --policy-path)              need_arg "$@"; POLICY_PATH="$2"; shift 2 ;;
+    --no-policy)                NO_POLICY=1; shift ;;
+    --allow-unvalidated-policy) ALLOW_UNVALIDATED_POLICY=1; shift ;;
+    --t3-bin)                   need_arg "$@"; T3_BIN_ARG="$2"; shift 2 ;;
+    --json)                     AS_JSON=1; shift ;;
     -h|--help)
       sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -67,7 +69,12 @@ case "$PROFILE" in
   *) echo "invalid --profile '$PROFILE' (expected standard or strict)" >&2; exit 2 ;;
 esac
 
-OS="${T3CODE_OS_OVERRIDE:-$(uname -s)}"
+TEST_MODE="${T3CODE_LOCKDOWN_TEST_MODE:-0}"
+if [ "$TEST_MODE" = "1" ] && [ -n "${T3CODE_OS_OVERRIDE:-}" ]; then
+  OS="$T3CODE_OS_OVERRIDE"
+else
+  OS="$(uname -s)"
+fi
 if [ -z "$POLICY_PATH" ]; then
   case "$OS" in
     Linux)  POLICY_PATH="/etc/t3code/policy.json" ;;
@@ -82,8 +89,12 @@ BEGIN="# >>> t3code-lockdown >>>"
 END="# <<< t3code-lockdown <<<"
 
 SUDO=""
-if [ "${T3CODE_NO_SUDO:-0}" != "1" ] && [ "$(id -u)" -ne 0 ]; then
-  SUDO="sudo"
+if [ "$(id -u)" -ne 0 ]; then
+  if [ "$TEST_MODE" = "1" ] && [ "${T3CODE_NO_SUDO:-0}" = "1" ]; then
+    SUDO=""
+  else
+    SUDO="sudo"
+  fi
 fi
 
 ACTIONS_FILE=""
@@ -226,7 +237,7 @@ apply_service_env() {
 
 apply_launchctl() {
   [ "$OS" = "Darwin" ] || return 0
-  [ "${T3CODE_SKIP_LAUNCHCTL:-0}" = "1" ] && return 0
+  if [ "$TEST_MODE" = "1" ] && [ "${T3CODE_SKIP_LAUNCHCTL:-0}" = "1" ]; then return 0; fi
   if launchctl setenv T3CODE_TELEMETRY_ENABLED false && launchctl setenv T3CODE_OTEL_SDK_DISABLED true; then
     log_action "[launchctl] set for current macOS login session"
   else
@@ -238,6 +249,7 @@ discover_t3_for_apply() {
   if [ -n "$T3_BIN_ARG" ] && [ -x "$T3_BIN_ARG" ]; then printf '%s' "$T3_BIN_ARG"; return; fi
   if [ -n "${T3_BIN:-}" ] && [ -x "${T3_BIN}" ]; then printf '%s' "$T3_BIN"; return; fi
   if command -v t3 >/dev/null 2>&1; then command -v t3; return; fi
+  if [ -x "$T3_HOME/bin/t3" ]; then printf '%s' "$T3_HOME/bin/t3"; return; fi
   local candidate
   candidate="$(ls -t "$T3_HOME"/wsl-runtime/sha256-*/t3 2>/dev/null | head -n1 || true)"
   if [ -n "$candidate" ] && [ -x "$candidate" ]; then printf '%s' "$candidate"; return; fi
@@ -250,7 +262,10 @@ apply_policy() {
   fi
   # Guard against macOS MDM profile conflict (T3 Code refuses to start if both exist).
   if [ "$OS" = "Darwin" ]; then
-    local mdm_plist="${T3CODE_MACOS_MDM_PLIST:-/Library/Managed Preferences/com.t3tools.t3code.plist}"
+    local mdm_plist="/Library/Managed Preferences/com.t3tools.t3code.plist"
+    if [ "$TEST_MODE" = "1" ] && [ -n "${T3CODE_MACOS_MDM_PLIST:-}" ]; then
+      mdm_plist="$T3CODE_MACOS_MDM_PLIST"
+    fi
     if [ -e "$mdm_plist" ]; then
       log_action "[policy] SKIPPED: macOS MDM profile exists at $mdm_plist (coexistence breaks T3 Code startup; use --no-policy or coordinate with MDM)"
       return 0
@@ -269,6 +284,12 @@ apply_policy() {
       rm -f "$tmp"
       return 1
     fi
+  elif [ "$ALLOW_UNVALIDATED_POLICY" != "1" ]; then
+    log_action "[policy] ABORTED: t3 binary not found; refusing to write unvalidated policy (pass --t3-bin PATH or --allow-unvalidated-policy to override)"
+    rm -f "$tmp"
+    return 1
+  else
+    log_action "[policy] WARNING: t3 binary not found; writing policy without 't3 policy check' (--allow-unvalidated-policy)"
   fi
 
   if [ -f "$POLICY_PATH" ] && cmp -s "$tmp" "$POLICY_PATH"; then
@@ -333,7 +354,7 @@ rollback() {
     echo "[service.env] removed lockdown block (backup: $SERVICE_ENV.bak-$TS)"
   fi
 
-  if [ "$OS" = "Darwin" ] && [ "${T3CODE_SKIP_LAUNCHCTL:-0}" != "1" ]; then
+  if [ "$OS" = "Darwin" ] && { [ "$TEST_MODE" != "1" ] || [ "${T3CODE_SKIP_LAUNCHCTL:-0}" != "1" ]; }; then
     launchctl unsetenv T3CODE_TELEMETRY_ENABLED 2>/dev/null || true
     launchctl unsetenv T3CODE_OTEL_SDK_DISABLED 2>/dev/null || true
   fi

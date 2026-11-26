@@ -55,11 +55,6 @@
   "forbiddenProcesses": [
     "cloudflared"
   ],
-  "knownExternalHosts": [
-    "ingest.t3.codes",
-    "api.axiom.co",
-    "app.t3.codes"
-  ],
   "exitCodes": {
     "VERIFIED": 0,
     "FAIL": 1,
