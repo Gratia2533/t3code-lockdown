@@ -55,7 +55,7 @@ description: Lock down T3 Code on a machine so it stops sending usage telemetry,
 | WSL2 內 | `/etc/t3code/policy.json`（該 distro 內） | Windows 端絕不可有 policy 檔或 registry policy（見下方陷阱） |
 
 - 環境變數：Linux／macOS 桌面 app 讀 shell profile（`~/.bashrc`／`~/.zshrc`）；Windows 用「使用者環境變數」。`t3 service` 不讀 shell rc，改讀 `~/.t3/service.env`（存在時腳本會一併寫入與檢查）。macOS 另外以 `launchctl setenv` 補當前登入工作階段。
-- `apply` 在寫入 policy 前會先用 `t3 policy check` 預檢暫存檔，避免寫入無法啟動的壞 policy。
+- `apply` 在寫入 policy 前會先用 `t3 policy check` 預檢暫存檔，避免寫入無法啟動的壞 policy；**若找不到 `t3` 執行檔，預設會中止寫入 policy**（除非明確加上 `--allow-unvalidated-policy` / `-AllowUnvalidatedPolicy`，且驗證仍會回傳 `INCOMPLETE (30)`）。
 - **不要在 policy 加 `limits.clients` 卻漏掉 `"remote"`**：少了 `remote` 會讓 server 只聽 loopback 並停用 Tailscale Serve，導致手機連不上。
 
 ## Agent 操作步驟
@@ -115,9 +115,12 @@ powershell -ExecutionPolicy Bypass -File scripts\lockdown.ps1 -Mode Verify -Back
 
 ## Lock 後驗證涵蓋項目（三層唯讀稽核）
 
-1. **靜態層**：忽略註解並解析 shell rc／`service.env` 的**最後生效值**（防後方覆寫或 `unset`）；Windows 檢查 User/Process/Machine env 覆蓋；驗證 policy JSON 符合所選 profile 與權限安全（非 symlink、非 group/world writable）；偵測 macOS MDM、Windows GPO/Registry、以及 WSL 端誤存 Windows policy；檢查 `~/.t3/userdata/settings.json` 的敏感開關。
-2. **執行期層**：自動尋找 `t3`（`--t3-bin` → `T3_BIN` → `PATH` → `~/.t3/wsl-runtime/sha256-*/t3` → `tools/`／macOS `.app`）；執行 `t3 policy check` 取得指紋；解析 `t3 policy show` 與 `server-runtime.json` 確認 running server PID 存活且載入同一指紋；Linux/WSL 讀取 `/proc/<pid>/environ`（僅比對兩個目標鍵，絕不讀取或輸出機密）確認程序已吃到 env；檢查 `t3 status` 確認 `T3 Connect` 為 `off`。
-3. **連線與程序層（純唯讀、零 DNS 查詢）**：檢查系統程序表是否有 `cloudflared` 執行中（有則 `FAIL`，絕不 kill）；以純數字模式（`ss -H -tnp`，不觸發任何 DNS lookup）回報 server PID 的監聽／連線數量供透明檢視。
+1. **靜態層**：忽略註解並解析 `~/.bashrc`／`~/.zshrc` 與 `service.env` 的**最後生效值**（防後方覆寫或 `unset`），並唯讀掃描既有的 `~/.profile`、`~/.bash_profile`、`~/.zprofile`、`~/.zshenv` 是否存在衝突覆寫；Windows 檢查 User/Process/Machine env 覆蓋；驗證 policy JSON 符合所選 profile 與權限安全（非 symlink、非 group/world writable）；偵測 macOS MDM、Windows GPO/Registry、以及 WSL 端誤存 Windows policy；檢查 `~/.t3/userdata/settings.json` 的敏感開關。
+   - **靜態解析範圍限制**：僅解析頂層賦值與 `unset`，不實際執行 shell 腳本，也不追蹤 `source` 或動態 `if` 分支（Linux/WSL 端由執行期 `/proc/<pid>/environ` 補位實證）。
+2. **執行期層**：自動尋找 `t3`（`--t3-bin` → `T3_BIN` → `PATH` → `~/.t3/bin/t3(.cmd)` → `~/.t3/wsl-runtime/sha256-*/t3` → `tools/`／macOS `.app`）；執行 `t3 policy check` 取得指紋；解析 `t3 policy show` 與 `server-runtime.json` 確認 running server PID 存活且載入同一指紋；Linux/WSL 讀取 `/proc/<pid>/environ`（僅比對兩個目標鍵，絕不讀取或輸出機密）確認程序已吃到 env；檢查 `t3 status` 確認 `T3 Connect` 為 `off`。
+   - **macOS 範圍說明**：macOS 未提權時無法直接讀取其他程序的 `environ`，因此 macOS 的 `VERIFIED` 代表「shell rc + `launchctl getenv`（登入工作階段代理環境）+ `t3 policy show`/`server-runtime.json`（實時 policy 指紋）」皆通過，而非直接讀取 server 程序記憶體環境。
+3. **連線與程序層（純唯讀、零 DNS 查詢）**：檢查系統程序表是否有實際執行 `cloudflared`（比對命令本身而非任意參數，避免 `grep cloudflared` 誤報；發現則 `FAIL`，絕不 kill）；以純數字模式（`ss -H -atnp`）回報 server PID 的監聽／連線數量供透明檢視。
+   - **零 DNS 範圍說明**：為避免稽核本身向 `ingest.t3.codes` 等端點送出 DNS 查詢，本層不做反解或主機名稱封包比對；防外連主要依賴已驗證載入的 policy、環境變數、`t3 status` 與 `cloudflared` 檢查。
 4. **版本與 Schema 漂移層**：比對 `t3 --version`、`server-runtime.json` 的 `serverVersion`、`t3 policy templates` 吐出的最新 ADMX 欄位、以及 `t3 --help`／`t3 policy --help` 子命令是否超出 `references/baseline.json`。
 
 ## Drift Triage Protocol（偵測到 `DRIFT_DETECTED` 時必做）
@@ -177,6 +180,6 @@ WSL2 backend 時，手機連的是 WSL 內 server，需確認該 server 可從 t
 | 檔案 | 用途 |
 | --- | --- |
 | `references/baseline.json` | 已審計版本、Standard/Strict profile、必要環境變數、ADMX policy 與 CLI 子命令基準 |
-| `scripts/lockdown.sh` | Linux／WSL／macOS：`apply`／`verify`／`rollback`／`snapshot`（支援 `--profile`、`--org`、`--policy-path`、`--no-policy`、`--t3-bin`、`--json`） |
+| `scripts/lockdown.sh` | Linux／WSL／macOS：`apply`／`verify`／`rollback`／`snapshot`（支援 `--profile`、`--org`、`--policy-path`、`--no-policy`、`--t3-bin`、`--allow-unvalidated-policy`、`--json`） |
 | `scripts/audit_unix.py` / `audit_lib.py` | Unix 端唯讀稽核、policy 產生與漂移偵測模組（零外部相依 Python 3 stdlib） |
-| `scripts/lockdown.ps1` / `audit_windows.ps1` | Windows：`-Mode Apply\|Verify\|Rollback\|Snapshot`、`-Backend Wsl\|Windows`、`-Profile Standard\|Strict`、`-Organization`、`-T3Bin`、`-CheckWsl`、`-Json` |
+| `scripts/lockdown.ps1` / `audit_windows.ps1` | Windows：`-Mode Apply\|Verify\|Rollback\|Snapshot`、`-Backend Wsl\|Windows`、`-Profile Standard\|Strict`、`-Organization`、`-T3Bin`、`-AllowUnvalidatedPolicy`、`-CheckWsl`、`-Json` |

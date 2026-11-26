@@ -69,7 +69,7 @@ try {
   [IO.File]::WriteAllText($strictPol, ($strictObj | ConvertTo-Json -Depth 10), $utf8NoBom)
 
   $fixtureAdmx = Join-Path $TmpDir 'fixture.admx'
-  [IO.File]::WriteAllText($fixtureAdmx, '<?xml version="1.0" encoding="utf-8"?><policyDefinitions xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions"><policies><policy name="NewTelemetry" class="Machine"/></policies></policyDefinitions>', $utf8NoBom)
+  [IO.File]::WriteAllText($fixtureAdmx, '<?xml version="1.0" encoding="utf-8"?><policyDefinitions xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions"><policies><policy name="New''Telemetry" class="Machine"><elements><boolean id="NewTelemetry_enabled" valueName="NewTelemetry_enabled"/></elements></policy></policies></policyDefinitions>', $utf8NoBom)
 
   $mockCmd = Join-Path $TmpDir 'mock-t3.cmd'
   $mockBody = @'

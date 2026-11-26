@@ -158,6 +158,7 @@ class LockdownUnixTests(unittest.TestCase):
             {
                 "HOME": str(self.home),
                 "T3CODE_HOME": str(self.t3_home),
+                "T3CODE_LOCKDOWN_TEST_MODE": "1",
                 "T3CODE_NO_SUDO": "1",
                 "T3CODE_OS_OVERRIDE": "Linux",
                 "T3CODE_ASSUME_WSL": "0",
@@ -248,7 +249,9 @@ class LockdownUnixTests(unittest.TestCase):
         self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
         data2 = json.loads(res2.stdout)
         self.assertEqual(data2["verdict"], "VERIFIED")
-        self.assertTrue(data2["safeToClaimLocked"])
+        self.assertTrue(data2["testMode"])
+        # In explicit test mode, safeToClaimLocked stays False so test mocks cannot masquerade as live host verification.
+        self.assertFalse(data2["safeToClaimLocked"])
 
         # 3. Re-running apply is idempotent and returns VERIFIED (0)
         res3 = self._run(
@@ -449,13 +452,71 @@ class LockdownUnixTests(unittest.TestCase):
         self.assertIn("cloud-sync", report["drift"]["addedCliSubcommands"])
 
     def test_incomplete_when_t3_binary_missing(self) -> None:
-        # Run with a PATH that has python3/bash/standard tools but NO t3, and empty t3_home
-        self._run("apply", "--policy-path", str(self.policy_path))
+        # Without t3 binary, apply refuses to write an unvalidated policy by default.
+        res_refused = self._run("apply", "--policy-path", str(self.policy_path), "--json")
+        self.assertFalse(self.policy_path.exists())
+        self.assertEqual(res_refused.returncode, 1)  # FAIL because policy file was not written
+        self.assertTrue(any("ABORTED: t3 binary not found" in a for a in json.loads(res_refused.stdout)["appliedActions"]))
+
+        # With explicit --allow-unvalidated-policy, policy is written, but verify still fails closed as INCOMPLETE (30).
+        self._run("apply", "--policy-path", str(self.policy_path), "--allow-unvalidated-policy")
+        self.assertTrue(self.policy_path.exists())
         res = self._run("verify", "--policy-path", str(self.policy_path), "--json")
         self.assertEqual(res.returncode, 30, res.stdout)
         report = json.loads(res.stdout)
         self.assertEqual(report["verdict"], "INCOMPLETE")
         self.assertFalse(report["safeToClaimLocked"])
+
+    def test_test_overrides_ignored_and_refuse_verified_outside_test_mode(self) -> None:
+        t3_bin = create_mock_t3(self.root / "t3", show_state="loaded")
+        self._write_live_runtime()
+        self._run("apply", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin))
+        # Disable T3CODE_LOCKDOWN_TEST_MODE while leaving test override env vars set -> must NOT return VERIFIED!
+        res = self._run(
+            "verify",
+            "--policy-path",
+            str(self.policy_path),
+            "--t3-bin",
+            str(t3_bin),
+            "--json",
+            env_extra={"T3CODE_LOCKDOWN_TEST_MODE": "0"},
+        )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        report = json.loads(res.stdout)
+        self.assertFalse(report["safeToClaimLocked"])
+        self.assertFalse(report["testMode"])
+        self.assertTrue(
+            any(c["id"] == "audit.unexpected_test_env" and c["status"] == "INCOMPLETE" for c in report["checks"])
+        )
+
+    def test_grep_cloudflared_does_not_false_positive(self) -> None:
+        t3_bin = create_mock_t3(self.root / "t3", show_state="loaded")
+        self._write_live_runtime()
+        self._run("apply", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin))
+        # A grep or editor mentioning cloudflared in its arguments should NOT trigger FAIL.
+        self.ps_file.write_text(
+            "101 grep grep cloudflared /var/log/syslog\n102 vim vim cloudflared.md\n",
+            encoding="utf-8",
+        )
+        res_ok = self._run("verify", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin), "--json")
+        self.assertEqual(res_ok.returncode, 0, res_ok.stdout)
+
+        # Wrapper invoking cloudflared binary itself MUST still trigger FAIL.
+        self.ps_file.write_text("202 sudo sudo -u root /usr/bin/cloudflared tunnel run\n", encoding="utf-8")
+        res_fail = self._run("verify", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin), "--json")
+        self.assertEqual(res_fail.returncode, 1, res_fail.stdout)
+        report = json.loads(res_fail.stdout)
+        self.assertTrue(any(c["id"] == "network.forbidden_processes" and c["status"] == "FAIL" for c in report["checks"]))
+
+    def test_extra_startup_profile_override_caught(self) -> None:
+        t3_bin = create_mock_t3(self.root / "t3", show_state="loaded")
+        self._write_live_runtime()
+        self._run("apply", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin))
+        (self.home / ".zprofile").write_text("export T3CODE_TELEMETRY_ENABLED=true\n", encoding="utf-8")
+        res = self._run("verify", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin), "--json")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        report = json.loads(res.stdout)
+        self.assertTrue(any(c["id"].startswith("env.profile:") and c["status"] == "FAIL" for c in report["checks"]))
 
     def test_fail_on_cloudflared_t3_connect_and_publish_activity(self) -> None:
         t3_bin = create_mock_t3(self.root / "t3", show_state="loaded", connect_state="on")
