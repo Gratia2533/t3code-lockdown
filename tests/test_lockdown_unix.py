@@ -493,20 +493,31 @@ class LockdownUnixTests(unittest.TestCase):
         t3_bin = create_mock_t3(self.root / "t3", show_state="loaded")
         self._write_live_runtime()
         self._run("apply", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin))
-        # A grep or editor mentioning cloudflared in its arguments should NOT trigger FAIL.
+        # A grep, editor, or shell-wrapped grep mentioning cloudflared in its arguments should NOT trigger FAIL.
         self.ps_file.write_text(
-            "101 grep grep cloudflared /var/log/syslog\n102 vim vim cloudflared.md\n",
+            '101 grep grep cloudflared /var/log/syslog\n'
+            '102 vim vim cloudflared.md\n'
+            '103 sh sh -c "grep cloudflared /var/log/syslog"\n',
             encoding="utf-8",
         )
         res_ok = self._run("verify", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin), "--json")
         self.assertEqual(res_ok.returncode, 0, res_ok.stdout)
 
-        # Wrapper invoking cloudflared binary itself MUST still trigger FAIL.
-        self.ps_file.write_text("202 sudo sudo -u root /usr/bin/cloudflared tunnel run\n", encoding="utf-8")
-        res_fail = self._run("verify", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin), "--json")
-        self.assertEqual(res_fail.returncode, 1, res_fail.stdout)
-        report = json.loads(res_fail.stdout)
-        self.assertTrue(any(c["id"] == "network.forbidden_processes" and c["status"] == "FAIL" for c in report["checks"]))
+        # Wrappers and shell -c invoking cloudflared MUST all trigger FAIL.
+        for ps_line in (
+            "202 sudo sudo -u root /usr/bin/cloudflared tunnel run\n",
+            "203 sh sh -c cloudflared tunnel run\n",
+            '204 sh sh -c "cloudflared tunnel run"\n',
+            '205 bash bash -lc "cd /tmp && /usr/bin/cloudflared tunnel run"\n',
+        ):
+            self.ps_file.write_text(ps_line, encoding="utf-8")
+            res_fail = self._run("verify", "--policy-path", str(self.policy_path), "--t3-bin", str(t3_bin), "--json")
+            self.assertEqual(res_fail.returncode, 1, f"expected FAIL for {ps_line!r}: {res_fail.stdout}")
+            report = json.loads(res_fail.stdout)
+            self.assertTrue(
+                any(c["id"] == "network.forbidden_processes" and c["status"] == "FAIL" for c in report["checks"]),
+                f"expected network.forbidden_processes FAIL for {ps_line!r}",
+            )
 
     def test_extra_startup_profile_override_caught(self) -> None:
         t3_bin = create_mock_t3(self.root / "t3", show_state="loaded")

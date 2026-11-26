@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -349,9 +350,18 @@ def read_proc_env_selected(pid: int, keys: list[str]) -> tuple[dict[str, str | N
     return result, None
 
 
-def _args_executes_binary(args_s: str, binary_name: str) -> bool:
-    """Return True if args_s actually invokes binary_name as the command (not as a grep/editor argument)."""
-    tokens = args_s.split()
+def _safe_shlex_split(text: str) -> list[str]:
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def _args_executes_binary(args_s: str, binary_name: str, _depth: int = 0) -> bool:
+    """Return True if args_s invokes binary_name as a command (including via wrappers or shell -c)."""
+    if _depth > 3:
+        return False
+    tokens = _safe_shlex_split(args_s)
     if not tokens:
         return False
     wrapper_val_flags = {
@@ -362,6 +372,7 @@ def _args_executes_binary(args_s: str, binary_name: str) -> bool:
         "ionice": {"-c", "-n", "-p", "-P", "-u"},
     }
     wrappers = set(wrapper_val_flags) | {"nohup", "setsid", "exec"}
+    shells = {"sh", "bash", "dash", "zsh", "ksh", "ash", "fish"}
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
@@ -385,6 +396,26 @@ def _args_executes_binary(args_s: str, binary_name: str) -> bool:
                     continue
                 break
             continue
+        if base in shells:
+            idx += 1
+            while idx < len(tokens):
+                cur = tokens[idx]
+                if cur == "--":
+                    idx += 1
+                    break
+                if cur.startswith("-") and not cur.startswith("--") and "c" in cur[1:]:
+                    idx += 1
+                    if idx < len(tokens):
+                        cmd_str = tokens[idx]
+                        for subcmd in re.split(r"(?:&&|\|\||[;|&]|\n)+", cmd_str):
+                            if _args_executes_binary(subcmd.strip(), binary_name, _depth + 1):
+                                return True
+                    return False
+                if cur.startswith("-"):
+                    idx += 1
+                    continue
+                break
+            return False
         return base == binary_name
     return False
 
