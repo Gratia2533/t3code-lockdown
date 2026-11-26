@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check shell and Python scripts
+        run: |
+          bash -n t3code-lockdown/scripts/lockdown.sh
+          python3 -m py_compile t3code-lockdown/scripts/audit_lib.py t3code-lockdown/scripts/audit_unix.py tests/test_lockdown_unix.py
+      - name: Run Unix test suite
+        run: python3 -m unittest discover -s tests -v
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run PowerShell test suite
+        shell: powershell
+        run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests\test_lockdown_ps1.ps1
