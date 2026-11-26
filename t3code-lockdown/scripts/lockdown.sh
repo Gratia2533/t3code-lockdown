@@ -1,37 +1,121 @@
 #!/usr/bin/env bash
 # T3 Code lockdown for Linux / WSL2 / macOS.
-# Usage: lockdown.sh [apply|verify|rollback] [--org NAME] [--policy-path PATH] [--no-policy]
+# Usage:
+#   lockdown.sh [apply|verify|rollback|snapshot]
+#               [--profile standard|strict] [--org NAME]
+#               [--policy-path PATH] [--no-policy]
+#               [--t3-bin PATH] [--json]
+#
+# Exit codes (verify / apply):
+#   0  = VERIFIED        (all static, runtime, network, and drift checks passed)
+#   1  = FAIL            (missing/wrong/overridden config, conflict, or forbidden process)
+#   10 = PENDING_RESTART (disk config valid, but T3 Code not running or needs restart)
+#   20 = DRIFT_DETECTED  (unaudited T3 Code version or schema/CLI changes detected)
+#   30 = INCOMPLETE      (required verification dependency or t3 binary unavailable)
+#
 # Idempotent. Backs up every file before modifying it. Never touches firewall/hosts/processes.
 set -euo pipefail
 
-MODE="${1:-apply}"; [ $# -gt 0 ] && shift || true
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BASELINE_PATH="${T3CODE_LOCKDOWN_BASELINE:-$SKILL_ROOT/references/baseline.json}"
+AUDIT_HELPER="$SCRIPT_DIR/audit_unix.py"
+
+MODE="apply"
+if [ $# -gt 0 ]; then
+  case "$1" in
+    apply|verify|rollback|snapshot) MODE="$1"; shift ;;
+    -h|--help)
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+  esac
+fi
+
+PROFILE="standard"
 ORG="Local"
 POLICY_PATH=""
 NO_POLICY=0
+T3_BIN_ARG=""
+AS_JSON=0
+
+need_arg() {
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    echo "missing value for $1" >&2
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --org) ORG="$2"; shift 2 ;;
-    --policy-path) POLICY_PATH="$2"; shift 2 ;;
-    --no-policy) NO_POLICY=1; shift ;;
+    --profile)     need_arg "$@"; PROFILE="$2"; shift 2 ;;
+    --org)         need_arg "$@"; ORG="$2"; shift 2 ;;
+    --policy-path) need_arg "$@"; POLICY_PATH="$2"; shift 2 ;;
+    --no-policy)   NO_POLICY=1; shift ;;
+    --t3-bin)      need_arg "$@"; T3_BIN_ARG="$2"; shift 2 ;;
+    --json)        AS_JSON=1; shift ;;
+    -h|--help)
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-OS="$(uname -s)"
-# Paths from T3 Code docs/user/managed-policy.md ("Where the policy goes").
+case "$PROFILE" in
+  standard|strict) ;;
+  *) echo "invalid --profile '$PROFILE' (expected standard or strict)" >&2; exit 2 ;;
+esac
+
+OS="${T3CODE_OS_OVERRIDE:-$(uname -s)}"
 if [ -z "$POLICY_PATH" ]; then
   case "$OS" in
     Linux)  POLICY_PATH="/etc/t3code/policy.json" ;;
     Darwin) POLICY_PATH="/Library/Application Support/T3Code/policy.json" ;;
   esac
 fi
-SERVICE_ENV="${T3CODE_SERVICE_ENV:-$HOME/.t3/service.env}"  # background service (t3 service) env file
+
+T3_HOME="${T3CODE_HOME:-$HOME/.t3}"
+SERVICE_ENV="${T3CODE_SERVICE_ENV:-$T3_HOME/service.env}"
 TS="$(date +%Y%m%d-%H%M%S)"
 BEGIN="# >>> t3code-lockdown >>>"
 END="# <<< t3code-lockdown <<<"
 
 SUDO=""
-if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
+if [ "${T3CODE_NO_SUDO:-0}" != "1" ] && [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
+
+ACTIONS_FILE=""
+cleanup() {
+  [ -n "$ACTIONS_FILE" ] && rm -f "$ACTIONS_FILE" || true
+}
+trap cleanup EXIT
+
+log_action() {
+  if [ -n "$ACTIONS_FILE" ]; then
+    printf '%s\n' "$1" >> "$ACTIONS_FILE"
+  elif [ "$AS_JSON" = "1" ]; then
+    printf '%s\n' "$1" >&2
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+require_python3() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    if [ "$AS_JSON" = "1" ]; then
+      printf '{"verdict":"INCOMPLETE","exitCode":30,"safeToClaimLocked":false,"error":"python3 is required for audit and policy generation"}\n'
+    else
+      echo "[INCOMPLETE] python3 not found; cannot complete strict verification (exit 30)" >&2
+    fi
+    exit 30
+  fi
+  if [ ! -f "$BASELINE_PATH" ] || [ ! -f "$AUDIT_HELPER" ]; then
+    echo "[FAIL] missing skill reference or helper ($BASELINE_PATH / $AUDIT_HELPER)" >&2
+    exit 1
+  fi
+}
 
 rc_files() {
   local f found=0
@@ -47,55 +131,20 @@ rc_files() {
   fi
 }
 
-json_escape() {
-  # Escape backslash and double quote for a JSON string value.
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  printf '%s' "$s"
+rc_files_csv() {
+  local list="" f
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if [ -z "$list" ]; then list="$f"; else list="$list,$f"; fi
+  done < <(rc_files)
+  printf '%s' "$list"
 }
 
-policy_json() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$ORG" <<'PY'
-import json, sys
-print(json.dumps({
-    "schemaVersion": 1,
-    "organization": sys.argv[1],
-    "limits": {
-        "telemetry": False,
-        "connect": False,
-        "updates": {"mode": "off"},
-    },
-}, indent=2, ensure_ascii=False) + "\n")
-PY
-  else
-    cat <<JSON
-{
-  "schemaVersion": 1,
-  "organization": "$(json_escape "$ORG")",
-  "limits": {
-    "telemetry": false,
-    "connect": false,
-    "updates": { "mode": "off" }
-  }
-}
-JSON
-  fi
-}
-
-assert_json_file() {
-  local f=$1
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f"
-  fi
-}
-
-strip_block() { # file -> stdout without our marker block
+strip_block() {
   awk -v b="$BEGIN" -v e="$END" '$0==b{s=1;next} $0==e{s=0;next} !s' "$1"
 }
 
-# Overwrite $1 in place so mode, ownership and symlink target are kept (do not mv a new file over it).
+# Overwrite $1 in place so mode, ownership and symlink target are kept.
 rewrite_in_place() {
   local f=$1 tmp
   tmp="$(mktemp)"
@@ -104,131 +153,229 @@ rewrite_in_place() {
   rm -f "$tmp"
 }
 
-apply_service_env() {
-  # `t3 service` does not read shell rc files; it reads ~/.t3/service.env (KEY=VALUE). Only touched if it exists.
-  local f="$SERVICE_ENV"
-  if [ ! -f "$f" ]; then echo "[service.env] $f not found (skipped; if you use 't3 service', add the two flags there and run 't3 service restart')"; return; fi
-  if grep -qF "$BEGIN" "$f"; then echo "[service.env] already has lockdown block (unchanged)"; return; fi
-  cp -p "$f" "$f.bak-$TS"
-  printf '\n%s\nT3CODE_TELEMETRY_ENABLED=false\nT3CODE_OTEL_SDK_DISABLED=true\n%s\n' "$BEGIN" "$END" >> "$f"
-  echo "[service.env] added lockdown block (backup: $f.bak-$TS); run 't3 service restart' (ask the user)"
-}
-
-apply_launchctl() {
-  # macOS GUI apps launched from Dock/Finder: set for the current login session too (does not survive reboot; rc file covers the desktop app per T3 docs).
-  [ "$OS" = "Darwin" ] || return 0
-  launchctl setenv T3CODE_TELEMETRY_ENABLED false && launchctl setenv T3CODE_OTEL_SDK_DISABLED true && echo "[launchctl] set for current session"
+env_file_state() {
+  # Prints: OK | CONFLICT | NEEDS_WRITE
+  local f=$1 kind=$2
+  python3 - "$AUDIT_HELPER" "$BASELINE_PATH" "$f" "$kind" <<'PY'
+import json, subprocess, sys
+helper, baseline, fpath, kind = sys.argv[1:5]
+p = subprocess.run([sys.executable, helper, "check-env-file", "--baseline", baseline, "--file", fpath, "--kind", kind], capture_output=True, text=True)
+data = json.loads(p.stdout)
+if data["ok"]:
+    print("OK")
+elif data["conflicts"]:
+    print("CONFLICT")
+else:
+    print("NEEDS_WRITE")
+PY
 }
 
 apply_env() {
-  local f
+  local f state
   while IFS= read -r f; do
+    [ -z "$f" ] && continue
     [ -f "$f" ] || : > "$f"
-    if grep -qF "$BEGIN" "$f"; then echo "[env] $f: already has lockdown block (unchanged)"; continue; fi
-    if grep -q 'T3CODE_TELEMETRY_ENABLED' "$f"; then echo "[env] $f: T3CODE_TELEMETRY_ENABLED already set manually (unchanged, check value)"; continue; fi
-    cp -p "$f" "$f.bak-$TS"
-    printf '\n%s\nexport T3CODE_TELEMETRY_ENABLED=false\nexport T3CODE_OTEL_SDK_DISABLED=true\n%s\n' "$BEGIN" "$END" >> "$f"
-    echo "[env] $f: added lockdown block (backup: $f.bak-$TS)"
+    state="$(env_file_state "$f" rc)"
+    if [ "$state" = "OK" ]; then
+      if grep -qF "$BEGIN" "$f"; then
+        log_action "[env] $f: already has effective lockdown flags (unchanged)"
+      else
+        log_action "[env] $f: already sets required flags manually (unchanged)"
+      fi
+      continue
+    fi
+    if [ "$state" = "CONFLICT" ]; then
+      log_action "[env] $f: CONFLICTING manual/trailing override detected (not modified; fix file manually)"
+      continue
+    fi
+    if grep -qF "$BEGIN" "$f"; then
+      cp -p "$f" "$f.bak-$TS"
+      rewrite_in_place "$f"
+      printf '\n%s\nexport T3CODE_TELEMETRY_ENABLED=false\nexport T3CODE_OTEL_SDK_DISABLED=true\n%s\n' "$BEGIN" "$END" >> "$f"
+      log_action "[env] $f: refreshed lockdown block (backup: $f.bak-$TS)"
+    else
+      cp -p "$f" "$f.bak-$TS"
+      printf '\n%s\nexport T3CODE_TELEMETRY_ENABLED=false\nexport T3CODE_OTEL_SDK_DISABLED=true\n%s\n' "$BEGIN" "$END" >> "$f"
+      log_action "[env] $f: added lockdown block (backup: $f.bak-$TS)"
+    fi
   done < <(rc_files)
+}
+
+apply_service_env() {
+  local f="$SERVICE_ENV" state
+  if [ ! -f "$f" ]; then
+    log_action "[service.env] $f not found (skipped; if you use 't3 service', add the two flags there and run 't3 service restart')"
+    return
+  fi
+  state="$(env_file_state "$f" service)"
+  if [ "$state" = "OK" ]; then
+    log_action "[service.env] $f: already has effective lockdown flags (unchanged)"
+    return
+  fi
+  if [ "$state" = "CONFLICT" ]; then
+    log_action "[service.env] $f: CONFLICTING value detected (not modified; fix file manually)"
+    return
+  fi
+  cp -p "$f" "$f.bak-$TS"
+  if grep -qF "$BEGIN" "$f"; then
+    rewrite_in_place "$f"
+  fi
+  printf '\n%s\nT3CODE_TELEMETRY_ENABLED=false\nT3CODE_OTEL_SDK_DISABLED=true\n%s\n' "$BEGIN" "$END" >> "$f"
+  log_action "[service.env] updated lockdown block (backup: $f.bak-$TS); run 't3 service restart' (ask the user)"
+}
+
+apply_launchctl() {
+  [ "$OS" = "Darwin" ] || return 0
+  [ "${T3CODE_SKIP_LAUNCHCTL:-0}" = "1" ] && return 0
+  if launchctl setenv T3CODE_TELEMETRY_ENABLED false && launchctl setenv T3CODE_OTEL_SDK_DISABLED true; then
+    log_action "[launchctl] set for current macOS login session"
+  else
+    log_action "[launchctl] failed to set current session env (re-login required)"
+  fi
+}
+
+discover_t3_for_apply() {
+  if [ -n "$T3_BIN_ARG" ] && [ -x "$T3_BIN_ARG" ]; then printf '%s' "$T3_BIN_ARG"; return; fi
+  if [ -n "${T3_BIN:-}" ] && [ -x "${T3_BIN}" ]; then printf '%s' "$T3_BIN"; return; fi
+  if command -v t3 >/dev/null 2>&1; then command -v t3; return; fi
+  local candidate
+  candidate="$(ls -t "$T3_HOME"/wsl-runtime/sha256-*/t3 2>/dev/null | head -n1 || true)"
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then printf '%s' "$candidate"; return; fi
 }
 
 apply_policy() {
-  if [ "$NO_POLICY" = 1 ] || [ -z "$POLICY_PATH" ]; then echo "[policy] skipped (no policy path for $OS; use --policy-path)"; return; fi
-  local tmp; tmp="$(mktemp)"; policy_json > "$tmp"
-  if ! assert_json_file "$tmp"; then
-    echo "[FAIL] generated policy is not valid JSON (check --org for quotes/backslashes)" >&2
-    rm -f "$tmp"
-    return 1
-  fi
-  if [ -f "$POLICY_PATH" ] && cmp -s "$tmp" "$POLICY_PATH"; then
-    echo "[policy] $POLICY_PATH already up to date (unchanged)"; rm -f "$tmp"; return
-  fi
-  $SUDO mkdir -p "$(dirname "$POLICY_PATH")"
-  if [ -f "$POLICY_PATH" ]; then $SUDO cp -p "$POLICY_PATH" "$POLICY_PATH.bak-$TS"; echo "[policy] backup: $POLICY_PATH.bak-$TS"; fi
-  $SUDO install -m 0644 "$tmp" "$POLICY_PATH"; rm -f "$tmp"
-  echo "[policy] wrote $POLICY_PATH"
-}
-
-check_flags() {
-  local f=$1 label=$2
-  if grep -q 'T3CODE_TELEMETRY_ENABLED=false' "$f" && grep -q 'T3CODE_OTEL_SDK_DISABLED=true' "$f"; then
-    echo "[ok]   $label flags in $f"
+  if [ "$NO_POLICY" = 1 ] || [ -z "$POLICY_PATH" ]; then
+    log_action "[policy] skipped (--no-policy or no policy path for $OS)"
     return 0
   fi
-  echo "[FAIL] $label flags missing in $f"
-  return 1
+  # Guard against macOS MDM profile conflict (T3 Code refuses to start if both exist).
+  if [ "$OS" = "Darwin" ]; then
+    local mdm_plist="${T3CODE_MACOS_MDM_PLIST:-/Library/Managed Preferences/com.t3tools.t3code.plist}"
+    if [ -e "$mdm_plist" ]; then
+      log_action "[policy] SKIPPED: macOS MDM profile exists at $mdm_plist (coexistence breaks T3 Code startup; use --no-policy or coordinate with MDM)"
+      return 0
+    fi
+  fi
+
+  local tmp t3_bin
+  tmp="$(mktemp)"
+  python3 "$AUDIT_HELPER" generate-policy --baseline "$BASELINE_PATH" --profile "$PROFILE" --org "$ORG" > "$tmp"
+
+  # Pre-validate policy with t3 CLI before deploying so we never write a startup-breaking policy.
+  t3_bin="$(discover_t3_for_apply || true)"
+  if [ -n "$t3_bin" ]; then
+    if ! "$t3_bin" policy check "$tmp" >/dev/null 2>&1; then
+      log_action "[policy] ABORTED: 't3 policy check' rejected generated '$PROFILE' policy (not written)"
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
+
+  if [ -f "$POLICY_PATH" ] && cmp -s "$tmp" "$POLICY_PATH"; then
+    log_action "[policy] $POLICY_PATH already up to date for '$PROFILE' profile (unchanged)"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  $SUDO mkdir -p "$(dirname "$POLICY_PATH")"
+  if [ -f "$POLICY_PATH" ]; then
+    $SUDO cp -p "$POLICY_PATH" "$POLICY_PATH.bak-$TS"
+    log_action "[policy] backup: $POLICY_PATH.bak-$TS"
+  fi
+  $SUDO install -m 0644 "$tmp" "$POLICY_PATH"
+  rm -f "$tmp"
+  log_action "[policy] wrote $POLICY_PATH (profile: $PROFILE, org: $ORG)"
 }
 
-verify() {
-  local rc=0 f
-  while IFS= read -r f; do
-    if [ -f "$f" ]; then
-      check_flags "$f" "env" || rc=1
-    else
-      echo "[FAIL] env file missing: $f"; rc=1
-    fi
-  done < <(rc_files)
-  if [ -f "$SERVICE_ENV" ]; then
-    check_flags "$SERVICE_ENV" "service.env" || rc=1
-  fi
-  if [ -n "$POLICY_PATH" ] && [ "$NO_POLICY" = 0 ]; then
-    if [ -f "$POLICY_PATH" ]; then
-      if ! command -v python3 >/dev/null 2>&1; then echo "[info] python3 missing; rely on 't3 policy check' below"
-      elif python3 - "$POLICY_PATH" <<'PY'
-import json,sys
-p=json.load(open(sys.argv[1], encoding="utf-8")); l=p.get("limits",{})
-ok = p.get("schemaVersion")==1 and l.get("telemetry") is False and l.get("connect") is False and l.get("updates",{}).get("mode")=="off"
-sys.exit(0 if ok else 1)
-PY
-      then echo "[ok]   policy content valid: $POLICY_PATH"; else echo "[FAIL] policy content wrong: $POLICY_PATH"; rc=1; fi
-    else echo "[FAIL] policy missing: $POLICY_PATH"; rc=1; fi
-  fi
-  if command -v t3 >/dev/null 2>&1; then
-    if [ "$NO_POLICY" = 0 ] && [ -n "$POLICY_PATH" ] && [ -f "$POLICY_PATH" ]; then
-      if t3 policy check "$POLICY_PATH"; then
-        echo "[ok]   t3 policy check: $POLICY_PATH"
-      else
-        echo "[FAIL] t3 policy check failed: $POLICY_PATH"
-        rc=1
-      fi
-    fi
-    t3 policy show || true
-  else echo "[info] t3 CLI not on PATH; after restarting T3 Code run: t3 policy show (desktop app installs the t3 command)"; fi
-  echo "[note] env flags apply to NEW shells and a restarted T3 Code server. Restart T3 Code (ask the user; do not kill it yourself)."
-  return $rc
+run_verify() {
+  local -a cmd=(
+    python3 "$AUDIT_HELPER" verify
+    --baseline "$BASELINE_PATH"
+    --profile "$PROFILE"
+    --policy-path "$POLICY_PATH"
+    --rc-files "$(rc_files_csv)"
+    --service-env "$SERVICE_ENV"
+    --os-name "$OS"
+    --t3-home "$T3_HOME"
+  )
+  [ "$NO_POLICY" = 1 ] && cmd+=(--no-policy)
+  [ -n "$T3_BIN_ARG" ] && cmd+=(--t3-bin "$T3_BIN_ARG")
+  [ -n "$ACTIONS_FILE" ] && cmd+=(--actions-file "$ACTIONS_FILE")
+  [ "$AS_JSON" = 1 ] && cmd+=(--json)
+  "${cmd[@]}"
+}
+
+run_snapshot() {
+  local -a cmd=(
+    python3 "$AUDIT_HELPER" snapshot
+    --baseline "$BASELINE_PATH"
+    --os-name "$OS"
+    --t3-home "$T3_HOME"
+  )
+  [ -n "$T3_BIN_ARG" ] && cmd+=(--t3-bin "$T3_BIN_ARG")
+  "${cmd[@]}"
 }
 
 rollback() {
   local f latest bak
   while IFS= read -r f; do
+    [ -z "$f" ] && continue
     if [ -f "$f" ] && grep -qF "$BEGIN" "$f"; then
       cp -p "$f" "$f.bak-$TS"
       rewrite_in_place "$f"
       echo "[env] $f: removed lockdown block (backup: $f.bak-$TS)"
     fi
   done < <(rc_files)
+
   if [ -f "$SERVICE_ENV" ] && grep -qF "$BEGIN" "$SERVICE_ENV"; then
     cp -p "$SERVICE_ENV" "$SERVICE_ENV.bak-$TS"
     rewrite_in_place "$SERVICE_ENV"
     echo "[service.env] removed lockdown block (backup: $SERVICE_ENV.bak-$TS)"
   fi
-  if [ "$OS" = "Darwin" ]; then launchctl unsetenv T3CODE_TELEMETRY_ENABLED 2>/dev/null || true; launchctl unsetenv T3CODE_OTEL_SDK_DISABLED 2>/dev/null || true; fi
+
+  if [ "$OS" = "Darwin" ] && [ "${T3CODE_SKIP_LAUNCHCTL:-0}" != "1" ]; then
+    launchctl unsetenv T3CODE_TELEMETRY_ENABLED 2>/dev/null || true
+    launchctl unsetenv T3CODE_OTEL_SDK_DISABLED 2>/dev/null || true
+  fi
+
   if [ "$NO_POLICY" = 0 ] && [ -n "$POLICY_PATH" ] && [ -f "$POLICY_PATH" ]; then
     latest=""
     for bak in "$POLICY_PATH".bak-*; do
       [ -e "$bak" ] || continue
       latest="$bak"
     done
-    $SUDO mv "$POLICY_PATH" "$POLICY_PATH.removed-$TS"; echo "[policy] moved current policy to $POLICY_PATH.removed-$TS"
-    # Move (do not copy) the newest backup so a later rollback can step further back,
-    # including to a machine that originally had no policy file.
-    if [ -n "$latest" ]; then $SUDO mv "$latest" "$POLICY_PATH"; echo "[policy] restored $latest"; fi
+    $SUDO mv "$POLICY_PATH" "$POLICY_PATH.removed-$TS"
+    echo "[policy] moved current policy to $POLICY_PATH.removed-$TS"
+    if [ -n "$latest" ]; then
+      $SUDO mv "$latest" "$POLICY_PATH"
+      echo "[policy] restored $latest"
+    fi
   fi
 }
 
 case "$MODE" in
-  apply) apply_env; apply_service_env; apply_launchctl; apply_policy; verify ;;
-  verify) verify ;;
-  rollback) rollback ;;
-  *) echo "usage: $0 [apply|verify|rollback] [--org NAME] [--policy-path PATH] [--no-policy]" >&2; exit 2 ;;
+  apply)
+    require_python3
+    ACTIONS_FILE="$(mktemp)"
+    apply_env
+    apply_service_env
+    apply_launchctl
+    apply_policy || true
+    run_verify
+    ;;
+  verify)
+    require_python3
+    run_verify
+    ;;
+  snapshot)
+    require_python3
+    run_snapshot
+    ;;
+  rollback)
+    rollback
+    ;;
+  *)
+    echo "usage: $0 [apply|verify|rollback|snapshot] [--profile standard|strict] [--org NAME] [--policy-path PATH] [--no-policy] [--t3-bin PATH] [--json]" >&2
+    exit 2
+    ;;
 esac
